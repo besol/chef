@@ -1,5 +1,7 @@
 require 'chef/client'
 require 'singleton'
+require 'em-synchrony'
+require 'em-synchrony/em-http'
 
 class Chef
 
@@ -142,12 +144,54 @@ class Chef
 
       @eager_segments.each do |segment|
         segment_filenames = Array.new
-        cookbook.manifest[segment].each do |manifest_record|
+        EM.synchrony do
+          concurrency = 5 || Chef::Config[:concurrency_downloads]
 
-          cache_filename = sync_file_in_cookbook(cookbook, manifest_record)
-          # make the segment filenames a full path.
-          full_path_cache_filename = cache.load(cache_filename, false)
-          segment_filenames << full_path_cache_filename
+          segment_filenames = EM::Synchrony::Iterator.new(cookbook.manifest[segment], concurrency).map do |manifest_record, callback|
+            cache_filename = File.join("cookbooks", cookbook.name, manifest_record['path'])
+            mark_cached_file_valid(cache_filename)
+
+            # If the checksums are different between on-disk (current) and on-server
+            # (remote, per manifest), do the update. This will also execute if there
+            # is no current checksum.
+            if !cached_copy_up_to_date?(cache_filename, manifest_record['checksum'])
+              url = URI.parse(manifest_record['url'])
+              headers = server_api.build_headers(:GET, url , Hash.new, nil, true)
+
+              http = EventMachine::HttpRequest.new(url).aget :head => headers
+
+              http.callback do
+                raw_file = Tempfile.open("chef-rest")
+                if Chef::Platform.windows?
+                  raw_file.binmode #required for binary files on Windows platforms
+                end
+
+                Chef::Log.debug("Streaming download from #{url.to_s} to tempfile #{raw_file.path}")
+                raw_file.write(http.response)
+                raw_file.close
+
+                Chef::Log.info("Storing updated #{cache_filename} in the cache.")
+                cache.move_to(raw_file.path, cache_filename)
+                @events.updated_cookbook_file(cookbook.name, cache_filename)
+
+                # make the segment filenames a full path.
+                full_path_cache_filename = cache.load(cache_filename, false)
+                callback.return(full_path_cache_filename)
+              end
+
+              http.errback do
+                Chef::Log.debug("Not storing from #{url.to_s} as error from http request has been seen")
+                iter.next
+              end
+            else
+              # make the segment filenames a full path.
+              full_path_cache_filename = cache.load(cache_filename, false)
+              callback.return(full_path_cache_filename)
+              Chef::Log.debug("Not storing #{cache_filename}, as the cache is up to date.")
+            end
+          end
+
+          EventMachine.stop
         end
 
         # replace segment filenames with a full-path one.
