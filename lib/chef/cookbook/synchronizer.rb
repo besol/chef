@@ -145,7 +145,7 @@ class Chef
       @eager_segments.each do |segment|
         segment_filenames = Array.new
         EM.synchrony do
-          concurrency = 1 || Chef::Config[:concurrency_downloads]
+          concurrency = 5 || Chef::Config[:concurrency_downloads]
 
           segment_filenames = EM::Synchrony::Iterator.new(cookbook.manifest[segment], concurrency).map do |manifest_record, callback|
             cache_filename = File.join("cookbooks", cookbook.name, manifest_record['path'])
