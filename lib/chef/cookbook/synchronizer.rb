@@ -1,7 +1,6 @@
 require 'chef/client'
 require 'singleton'
-require 'em-synchrony'
-require 'em-synchrony/em-http'
+require 'typhoeus'
 
 class Chef
 
@@ -144,27 +143,36 @@ class Chef
 
       @eager_segments.each do |segment|
         segment_filenames = Array.new
-        EM.synchrony do
-          concurrency = 5 || Chef::Config[:concurrency_downloads]
+        concurrency = 100 || Chef::Config[:concurrency_downloads]
+        hydra = Typhoeus::Hydra.new(max_concurrency: concurrency)
 
-          segment_filenames = EM::Synchrony::Iterator.new(cookbook.manifest[segment], concurrency).map do |manifest_record, callback|
-            cache_filename = File.join("cookbooks", cookbook.name, manifest_record['path'])
-            mark_cached_file_valid(cache_filename)
+        cookbook.manifest[segment].each do |manifest_record|
+          cache_filename = File.join("cookbooks", cookbook.name, manifest_record['path'])
+          mark_cached_file_valid(cache_filename)
 
-            # If the checksums are different between on-disk (current) and on-server
-            # (remote, per manifest), do the update. This will also execute if there
-            # is no current checksum.
-            if !cached_copy_up_to_date?(cache_filename, manifest_record['checksum'])
-              url = URI.parse(manifest_record['url'])
+          # If the checksums are different between on-disk (current) and on-server
+          # (remote, per manifest), do the update. This will also execute if there
+          # is no current checksum.
+          if !cached_copy_up_to_date?(cache_filename, manifest_record['checksum'])
 
-              async_download(url) do |http|
+            url = URI.parse(manifest_record['url'])
+
+            # We obtian the special headers which are sent in the request
+            partial_header = server_api.send(:build_headers, :GET, url , Hash.new, nil, true)
+            headers = Chef::REST::RESTRequest.new(:GET, url, nil, partial_header).headers
+            headers['User-Agent'] = "#{Chef::REST::RESTRequest.user_agent} Typhoeus"
+
+            request = Typhoeus::Request.new(manifest_record['url'], followlocation: true, maxredirs: 2, headers: headers)
+
+            request.on_complete do |response|
+              if response.success?
                 raw_file = Tempfile.open("chef-rest")
                 if Chef::Platform.windows?
                   raw_file.binmode #required for binary files on Windows platforms
                 end
 
-                Chef::Log.debug("Streaming download from #{url.to_s} to tempfile #{raw_file.path}")
-                raw_file.write(http.response)
+                Chef::Log.debug("Streaming download from #{manifest_record['url'].to_s} to tempfile #{raw_file.path}")
+                raw_file.write(response.body)
                 raw_file.close
 
                 Chef::Log.info("Storing updated #{cache_filename} in the cache.")
@@ -173,18 +181,25 @@ class Chef
 
                 # make the segment filenames a full path.
                 full_path_cache_filename = cache.load(cache_filename, false)
-                callback.return(full_path_cache_filename)
+                segment_filenames.push full_path_cache_filename
+              elsif response.timed_out?
+                raise Timeout::Error, "Connection timeout in connecting to #{manifest_record['url']}, giving up"
+              elsif response.code == 0
+                raise Errno::ECONNREFUSED, "Connection refused connecting to #{manifest_record['url']}, giving up"
+              else
+                raise Errno::ECONNREFUSED, "Connection error connecting to #{manifest_record['url']}, giving up"
               end
-            else
-              # make the segment filenames a full path.
-              full_path_cache_filename = cache.load(cache_filename, false)
-              callback.return(full_path_cache_filename)
-              Chef::Log.debug("Not storing #{cache_filename}, as the cache is up to date.")
             end
-          end
 
-          EventMachine.stop
+            hydra.queue request
+          else
+            full_path_cache_filename = cache.load(cache_filename, false)
+            segment_filenames.push full_path_cache_filename
+            Chef::Log.debug("Not storing #{cache_filename}, as the cache is up to date.")
+          end
         end
+
+        hydra.run
 
         # replace segment filenames with a full-path one.
         if segment.to_sym == :recipes
@@ -240,50 +255,7 @@ class Chef
       Chef::Log.info("Storing updated #{destination} in the cache.")
       cache.move_to(raw_file.path, destination)
     end
-
-    #
-    # Async Download Function with retries
-    #
-    def async_download(url, retries=0, &block)
-      # We obtian the special headers which are sent in the request
-      partial_header = server_api.send(:build_headers, :GET, url , Hash.new, nil, true)
-      headers = Chef::REST::RESTRequest.new(:GET, url, nil, partial_header).headers
-      headers['user-agent'] = "#{Chef::REST::RESTRequest.user_agent} EventMachine"
-
-      request_options = { :redirects => 2, :keepalive => true, :head => headers }
-      http = EventMachine::HttpRequest.new(url).aget request_options
-
-
-      http.callback do
-        if http.response_header.status.to_i >= 400
-          Chef::Log.error("Server returned error for #{url.scheme}://#{url.host}:#{url.port}#{url.path}, with status code #{http.response_header.status} retrying #{retries+1}/#{Chef::Config[:http_retry_count]} in #{Chef::Config[:http_retry_delay]}s")
-          sleep(rand(Chef::Config[:http_retry_delay]))
-          if retries < Chef::Config[:http_retry_count] - 1
-            async_download(url, retries+1) do |http|
-              yield(http)
-            end
-          else
-            raise Errno::ECONNREFUSED, "Connection refused connecting to #{url.scheme}://#{url.host}:#{url.port}#{url.path} after #{retries+1} retries with status code #{http.response_header.status}, giving up"
-          end
-        else
-          yield(http)
-        end
-
-      end
-
-      http.errback do
-        Chef::Log.error("Server returned error for #{url.scheme}://#{url.host}:#{url.port}#{url.path}, with status code #{http.response_header.status} retrying #{retries+1}/#{Chef::Config[:http_retry_count]} in #{Chef::Config[:http_retry_delay]}s")
-        sleep(rand(Chef::Config[:http_retry_delay]))
-        if retries < Chef::Config[:http_retry_count] - 1
-          async_download(url, retries+1) do |http|
-            yield(http)
-          end
-        else
-          raise Timeout::Error, "Connection timeout in connecting to #{url.scheme}://#{url.host}:#{url.port}#{url.path} after #{retries+1} retries with status code #{http.response_header.status}, giving up"
-        end
-      end
-    end
-
+ 
     # Marks the given file as valid (non-stale).
     def mark_cached_file_valid(cache_filename)
       CookbookCacheCleaner.instance.mark_file_as_valid(cache_filename)
