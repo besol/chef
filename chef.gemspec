@@ -22,8 +22,7 @@ Gem::Specification.new do |s|
   s.add_dependency "rest-client", ">= 1.0.4", "< 1.7.0"
 
   # CHEF-XXXX: Improvement of parallel download in Synchronizing Cookbooks
-  s.add_dependency "em-synchrony", ">= 1.0.3"
-  s.add_dependency "em-http-request", ">= 1.1.0"
+  s.add_dependency "typhoeus"
 
   # The JSON gem reliably releases breaking changes as a patch release
   s.add_dependency "json", ">= 1.4.4", "<=  1.7.7"
